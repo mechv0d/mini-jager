@@ -11,7 +11,9 @@ load_dotenv()
 class Settings:
     bot_token: str = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
     bot_username: str = os.getenv("BOT_USERNAME", "ttsavefrom_bot").lstrip("@")
-    enable_cache: bool = os.getenv("ENABLE_CASHE", os.getenv("ENABLE_CASHE", "0")) == "0"
+    enable_cache: bool = (
+    os.getenv("ENABLE_CACHE", os.getenv("ENABLE_CASH", os.getenv("ENABLE_CASHE", "0"))) == "1"
+        )
     dump_chat_id: str | None = os.getenv("DUMP_CHAT_ID")
     cache_dir: Path = Path(os.getenv("CACHE_DIR", "./.cache"))
     cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "86400"))
@@ -29,3 +31,6 @@ class Settings:
 
 
 settings = Settings()
+
+print("ENABLE_CACHE =", settings.enable_cache)
+print("TIKTOK_PROXY =", settings.tiktok_proxy)
