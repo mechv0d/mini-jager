@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import (
     FSInputFile,
@@ -55,6 +55,8 @@ DUMP_CHAT_ID = os.getenv("DUMP_CHAT_ID")
 # Telegram Bot API при обычной загрузке multipart ограничивает видео примерно 50 MB.
 MAX_VIDEO_SIZE_BYTES = int(os.getenv("MAX_VIDEO_SIZE_MB", "48")) * 1024 * 1024
 
+TELEGRAM_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", "120"))
+TELEGRAM_UPLOAD_RETRIES = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
 
 # =======================
 # LOGGING
@@ -491,24 +493,53 @@ def public_error_message(exc: Exception) -> str:
 
 
 async def send_video_without_caption(message: Message, result: VideoResult) -> None:
-    if result.telegram_file_id:
-        sent = await message.answer_video(
-            video=result.telegram_file_id,
-            caption=None,
-            supports_streaming=True,
-        )
-    else:
-        sent = await message.answer_video(
-            video=FSInputFile(result.path),
-            caption=None,
-            supports_streaming=True,
-        )
+    last_error: Exception | None = None
 
-    if sent.video and sent.video.file_id:
-        await update_cache_telegram_file_id(result.video_id, sent.video.file_id)
+    for attempt in range(1, TELEGRAM_UPLOAD_RETRIES + 1):
+        try:
+            if result.telegram_file_id:
+                sent = await message.answer_video(
+                    video=result.telegram_file_id,
+                    caption=None,
+                    supports_streaming=True,
+                    request_timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
+                )
+            else:
+                sent = await message.answer_video(
+                    video=FSInputFile(result.path),
+                    caption=None,
+                    supports_streaming=True,
+                    request_timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
+                )
 
-    if result.temp_dir and result.temp_dir.exists():
-        shutil.rmtree(result.temp_dir, ignore_errors=True)
+            if sent.video and sent.video.file_id:
+                await update_cache_telegram_file_id(result.video_id, sent.video.file_id)
+
+            if result.temp_dir and result.temp_dir.exists():
+                shutil.rmtree(result.temp_dir, ignore_errors=True)
+
+            return
+
+        except TelegramNetworkError as exc:
+            last_error = exc
+            logger.warning(
+                "Telegram upload failed, attempt %s/%s: %s",
+                attempt,
+                TELEGRAM_UPLOAD_RETRIES,
+                exc,
+            )
+
+            if attempt < TELEGRAM_UPLOAD_RETRIES:
+                await asyncio.sleep(2 * attempt)
+                continue
+
+        except Exception as exc:
+            last_error = exc
+            raise
+
+    raise PublicBotError(
+        f"ошибка отправки видео в Telegram после {TELEGRAM_UPLOAD_RETRIES} попыток: {last_error}"
+    )
 
 
 async def ensure_telegram_file_id(bot: Bot, result: VideoResult) -> str:
@@ -527,6 +558,7 @@ async def ensure_telegram_file_id(bot: Bot, result: VideoResult) -> str:
         video=FSInputFile(result.path),
         caption=None,
         supports_streaming=True,
+        request_timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
     )
 
     if not sent.video or not sent.video.file_id:
@@ -557,7 +589,7 @@ async def on_startup() -> None:
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     await message.answer(
-        "Привет! Отправь ссылку на TikTok-видео, и я скачаю его без подписи.\n\n"
+        "Привет! Отправь ссылку на TikTok-видео, и я отправлю его сюда.\n\n"
         f"Также можно использовать inline-режим: @{BOT_USERNAME} https://www.tiktok.com/..."
     )
 
