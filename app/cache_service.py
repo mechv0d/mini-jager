@@ -5,17 +5,21 @@ import time
 from pathlib import Path
 
 from app.config import settings
-from app.models import VideoResult
+from app.models import DownloadResult, MediaAsset
 from app.url_utils import url_hash
 
 logger = logging.getLogger("ttsavefrom_bot.cache")
 
 _index_lock = asyncio.Lock()
-_video_locks: dict[str, asyncio.Lock] = {}
+_media_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_media_lock(media_id: str) -> asyncio.Lock:
+    return _media_locks.setdefault(media_id, asyncio.Lock())
 
 
 def get_video_lock(video_id: str) -> asyncio.Lock:
-    return _video_locks.setdefault(video_id, asyncio.Lock())
+    return get_media_lock(video_id)
 
 
 def ensure_cache_dir() -> None:
@@ -53,40 +57,63 @@ async def save_index(index: dict) -> None:
         await asyncio.to_thread(save_index_sync, index)
 
 
-def cache_record_to_result(video_id: str, record: dict) -> VideoResult | None:
-    path = Path(record.get("path", ""))
-    if not path.exists():
+def cache_record_to_result(media_id: str, record: dict) -> DownloadResult | None:
+    raw_assets = record.get("assets")
+    if raw_assets:
+        assets = [
+            MediaAsset(
+                path=Path(asset.get("path", "")),
+                telegram_file_id=asset.get("telegram_file_id"),
+                media_type=asset.get("media_type", "photo"),
+            )
+            for asset in raw_assets
+        ]
+    else:
+        # Backward compatibility with the old single-video cache shape.
+        assets = [
+            MediaAsset(
+                path=Path(record.get("path", "")),
+                telegram_file_id=record.get("telegram_file_id"),
+                media_type="video",
+            )
+        ]
+
+    if not assets or any(not asset.path.exists() for asset in assets):
         return None
 
-    return VideoResult(
-        video_id=video_id,
-        path=path,
+    return DownloadResult(
+        media_id=media_id,
+        kind=record.get("kind", "video"),
         source_url=record.get("source_url", ""),
         title=record.get("title"),
-        telegram_file_id=record.get("telegram_file_id"),
+        assets=assets,
         from_cache=True,
     )
 
 
-async def find_cached_by_video_id(video_id: str) -> VideoResult | None:
+async def find_cached_by_media_id(media_id: str) -> DownloadResult | None:
     if not settings.enable_cache:
         return None
 
     index = await load_index()
-    record = index.get("videos", {}).get(video_id)
+    record = index.get("videos", {}).get(media_id)
     if not record:
         return None
 
-    result = cache_record_to_result(video_id, record)
+    result = cache_record_to_result(media_id, record)
     if result:
         return result
 
-    index.get("videos", {}).pop(video_id, None)
+    index.get("videos", {}).pop(media_id, None)
     await save_index(index)
     return None
 
 
-async def find_cached_by_url(url: str) -> VideoResult | None:
+async def find_cached_by_video_id(video_id: str) -> DownloadResult | None:
+    return await find_cached_by_media_id(video_id)
+
+
+async def find_cached_by_url(url: str) -> DownloadResult | None:
     if not settings.enable_cache:
         return None
 
@@ -110,7 +137,7 @@ async def find_cached_by_url(url: str) -> VideoResult | None:
     return None
 
 
-async def put_cache(result: VideoResult, source_url: str) -> None:
+async def put_cache(result: DownloadResult, source_url: str) -> None:
     if not settings.enable_cache:
         return
 
@@ -118,29 +145,48 @@ async def put_cache(result: VideoResult, source_url: str) -> None:
     index.setdefault("videos", {})
     index.setdefault("aliases", {})
 
-    index["videos"][result.video_id] = {
-        "path": str(result.path),
+    index["videos"][result.media_id] = {
+        "kind": result.kind,
         "source_url": source_url,
         "title": result.title,
-        "telegram_file_id": result.telegram_file_id,
+        "assets": [
+            {
+                "path": str(asset.path),
+                "telegram_file_id": asset.telegram_file_id,
+                "media_type": asset.media_type,
+            }
+            for asset in result.assets
+        ],
         "created_at": int(time.time()),
     }
-    index["aliases"][url_hash(source_url)] = result.video_id
+    index["aliases"][url_hash(source_url)] = result.media_id
+
+    await save_index(index)
+
+
+async def update_cache_asset_file_id(media_id: str, asset_index: int, telegram_file_id: str) -> None:
+    if not settings.enable_cache:
+        return
+
+    index = await load_index()
+    record = index.get("videos", {}).get(media_id)
+    if not record:
+        return
+
+    assets = record.setdefault("assets", [])
+    if assets:
+        if asset_index >= len(assets):
+            return
+        assets[asset_index]["telegram_file_id"] = telegram_file_id
+    elif asset_index == 0:
+        # Backward compatibility with old records.
+        record["telegram_file_id"] = telegram_file_id
 
     await save_index(index)
 
 
 async def update_cache_telegram_file_id(video_id: str, telegram_file_id: str) -> None:
-    if not settings.enable_cache:
-        return
-
-    index = await load_index()
-    record = index.get("videos", {}).get(video_id)
-    if not record:
-        return
-
-    record["telegram_file_id"] = telegram_file_id
-    await save_index(index)
+    await update_cache_asset_file_id(video_id, 0, telegram_file_id)
 
 
 async def cache_heartbeat() -> None:
@@ -155,17 +201,22 @@ async def cache_heartbeat() -> None:
                 aliases = index.get("aliases", {})
 
                 expired_ids: list[str] = []
-                for video_id, record in list(videos.items()):
+                for media_id, record in list(videos.items()):
                     created_at = int(record.get("created_at", 0))
-                    path = Path(record.get("path", ""))
 
                     if now - created_at >= settings.cache_ttl_seconds:
-                        expired_ids.append(video_id)
-                        try:
-                            if path.exists():
-                                path.unlink()
-                        except Exception:
-                            logger.exception("Failed to delete cached file: %s", path)
+                        expired_ids.append(media_id)
+
+                        paths = [Path(asset.get("path", "")) for asset in record.get("assets", [])]
+                        if not paths and record.get("path"):
+                            paths = [Path(record.get("path", ""))]
+
+                        for path in paths:
+                            try:
+                                if path.exists():
+                                    path.unlink()
+                            except Exception:
+                                logger.exception("Failed to delete cached file: %s", path)
 
                 for video_id in expired_ids:
                     videos.pop(video_id, None)

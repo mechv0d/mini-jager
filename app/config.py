@@ -20,6 +20,10 @@ class Settings:
     cache_clean_interval_seconds: int = int(os.getenv("CACHE_CLEAN_INTERVAL_SECONDS", "60"))
     download_timeout_seconds: int = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "15"))
     max_video_size_bytes: int = int(os.getenv("MAX_VIDEO_SIZE_MB", "48")) * 1024 * 1024
+    max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "35"))
+    max_photo_size_bytes: int = int(os.getenv("MAX_PHOTO_SIZE_MB", "10")) * 1024 * 1024
+    photo_album_chunk_size: int = int(os.getenv("PHOTO_ALBUM_CHUNK_SIZE", "10"))
+    photo_caption_template: str = os.getenv("PHOTO_CAPTION_TEMPLATE", "Original: {url}")
     telegram_upload_timeout_seconds: int = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", "120"))
     telegram_upload_retries: int = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
     tiktok_proxy = os.getenv("TIKTOK_PROXY", "").strip() or None
@@ -31,6 +35,3 @@ class Settings:
 
 
 settings = Settings()
-
-print("ENABLE_CACHE =", settings.enable_cache)
-print("TIKTOK_PROXY =", settings.tiktok_proxy)

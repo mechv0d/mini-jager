@@ -3,11 +3,11 @@ import re
 from urllib.parse import urlparse, urlunparse
 
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
-LONG_TIKTOK_VIDEO_ID_RE = re.compile(r"/video/(\d+)", re.IGNORECASE)
+LONG_TIKTOK_MEDIA_ID_RE = re.compile(r"/(?:video|photo)/(\d+)", re.IGNORECASE)
 
 
 def normalize_url(url: str) -> str:
-    url = url.strip().strip(".,;!?)В»\"'")
+    url = url.strip().strip(".,;!?)»\"'")
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
@@ -42,10 +42,20 @@ def extract_tiktok_url(text: str | None) -> str | None:
 
 def parse_video_id_from_url(url: str) -> str | None:
     parsed = urlparse(url)
-    match = LONG_TIKTOK_VIDEO_ID_RE.search(parsed.path)
+    match = LONG_TIKTOK_MEDIA_ID_RE.search(parsed.path)
     if match:
         return match.group(1)
     return None
+
+
+def is_tiktok_photo_url(url: str) -> bool:
+    return bool(re.search(r"/photo/\d+", urlparse(url).path, flags=re.IGNORECASE))
+
+
+def to_ytdlp_tiktok_url(url: str) -> str:
+    parsed = urlparse(normalize_url(url))
+    path = re.sub(r"/photo/(\d+)", r"/video/\1", parsed.path, flags=re.IGNORECASE)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
 def url_hash(url: str) -> str:
