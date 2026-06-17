@@ -14,6 +14,10 @@ class MediaAsset:
     # and downloads photo_url only when the user selects this inline result.
     remote_url: str | None = None
     thumbnail_url: str | None = None
+    # Optional metadata for inline audio results. Safe to ignore for photos/videos.
+    title: str | None = None
+    performer: str | None = None
+    duration_seconds: int | None = None
 
 
 @dataclass

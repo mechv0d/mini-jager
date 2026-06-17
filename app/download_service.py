@@ -1,5 +1,6 @@
 import asyncio
 import html
+import os
 import json
 import logging
 import re
@@ -473,20 +474,36 @@ def extract_photo_urls(info: dict, *, include_thumbnails: bool = False) -> list[
 
 
 
-def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
-    """Return (photo_url, thumbnail_url) pairs for fast inline photo results.
+def extract_inline_album_assets(info: dict) -> list[MediaAsset]:
+    """Return ordered remote assets for inline slideshow results.
 
-    InlineQueryResultPhoto can show thumbnail_url immediately and send photo_url
-    only after the user chooses the result. This avoids uploading every HD image
-    to Telegram before answering the inline query.
+    TikTok photo/slideshow posts are usually image-only, but some rare posts can
+    contain short video slides. For inline mode we should preserve the slide type:
+    - photos become InlineQueryResultPhoto later;
+    - videos become InlineQueryResultVideo later.
+
+    The returned assets are URL-only; no HD media is downloaded or uploaded to
+    Telegram here.
     """
-    pairs: list[tuple[str, str]] = []
-    seen_photo_urls: set[str] = set()
+    assets: list[MediaAsset] = []
+    seen_keys: set[str] = set()
 
     def is_usable_url(value) -> bool:
         if not isinstance(value, str) or not value.startswith(("http://", "https://")):
             return False
         return ".heic" not in urlparse(value).path.lower()
+
+    def is_video_like_url(value: str) -> bool:
+        parsed = urlparse(value)
+        haystack = f"{parsed.netloc}{parsed.path}?{parsed.query}".lower()
+        return (
+            ".mp4" in haystack
+            or "mime_type=video" in haystack
+            or "mime_type=video_mp4" in haystack
+            or "/video/" in haystack
+            or "video/tos" in haystack
+            or "video_mp4" in haystack
+        )
 
     def collect_urls_from_container(container) -> list[str]:
         found: list[str] = []
@@ -508,10 +525,26 @@ def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
             if not isinstance(value, dict):
                 return
 
-            for key in ("url", "uri", "src", "displayUrl", "downloadUrl"):
+            for key in (
+                "url",
+                "uri",
+                "src",
+                "displayUrl",
+                "downloadUrl",
+                "playUrl",
+                "playApi",
+                "mainUrl",
+                "backupUrl",
+            ):
                 add_candidate(value.get(key))
 
-            for list_key in ("url_list", "urlList", "UrlList"):
+            for list_key in (
+                "url_list",
+                "urlList",
+                "UrlList",
+                "url_list_1",
+                "UrlList1",
+            ):
                 walk(value.get(list_key))
 
             for nested_key in (
@@ -528,35 +561,155 @@ def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
                 "thumb",
                 "preview",
                 "cover",
+                "coverUrl",
+                "originCover",
+                "dynamicCover",
+                "animatedCover",
+                "playAddr",
+                "downloadAddr",
+                "play_addr",
+                "download_addr",
+                "PlayAddr",
+                "DownloadAddr",
             ):
                 walk(value.get(nested_key))
 
         walk(container)
         return found
 
-    def first_url_from_keys(image: dict, keys: tuple[str, ...]) -> str | None:
+    def is_image_like_url(value: str) -> bool:
+        parsed = urlparse(value)
+        haystack = f"{parsed.netloc}{parsed.path}?{parsed.query}".lower()
+        return (
+            ".jpg" in haystack
+            or ".jpeg" in haystack
+            or ".webp" in haystack
+            or ".png" in haystack
+            or "mime_type=image" in haystack
+            or "/image/" in haystack
+            or "image/tos" in haystack
+            or "tos-maliva-i" in haystack
+            or "tos-alisg-i" in haystack
+        )
+
+    def first_url_from_keys(container: dict, keys: tuple[str, ...]) -> str | None:
         for key in keys:
-            candidates = collect_urls_from_container(image.get(key))
+            candidates = collect_urls_from_container(container.get(key))
             if candidates:
                 return candidates[0]
         return None
 
-    def add_pair(photo_url: str | None, thumbnail_url: str | None = None) -> None:
-        if not photo_url or not is_usable_url(photo_url) or photo_url in seen_photo_urls:
-            return
-        seen_photo_urls.add(photo_url)
-        pairs.append((photo_url, thumbnail_url or photo_url))
+    VIDEO_URL_KEYS = (
+        "playAddr",
+        "PlayAddr",
+        "play_addr",
+        "downloadAddr",
+        "DownloadAddr",
+        "download_addr",
+        "playUrl",
+        "play_url",
+        "videoUrl",
+        "videoURL",
+        "video_url",
+        "mainUrl",
+        "backupUrl",
+    )
 
-    def add_slide(image) -> None:
-        if isinstance(image, str):
-            add_pair(image, image)
-            return
+    VIDEO_CONTAINER_KEYS = (
+        "video",
+        "videoInfo",
+        "video_info",
+        "videoStruct",
+        "video_data",
+        "videoData",
+        "videoResource",
+        "video_resource",
+        "livePhoto",
+        "live_photo",
+        "motionPhoto",
+        "motion_photo",
+        "animatedImage",
+        "animated_image",
+        "playAddr",
+        "downloadAddr",
+        "play_addr",
+        "download_addr",
+        "PlayAddr",
+        "DownloadAddr",
+        "bitrateInfo",
+        "bitrate_info",
+        "bitRate",
+        "bit_rate",
+    )
 
-        if not isinstance(image, dict):
-            return
+    def first_deep_url_from_keys(container, keys: tuple[str, ...], *, allow_image_fallback: bool = False) -> str | None:
+        """Find a URL under specific video-address keys, even in nested bitrate arrays."""
+        stack = [container]
+        seen: set[int] = set()
 
+        while stack:
+            current = stack.pop()
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    if key in keys:
+                        candidates = collect_urls_from_container(value)
+                        for candidate in candidates:
+                            if is_video_like_url(candidate):
+                                return candidate
+                        if allow_image_fallback:
+                            for candidate in candidates:
+                                if not is_image_like_url(candidate):
+                                    return candidate
+                            if candidates:
+                                return candidates[0]
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(current, list):
+                stack.extend(current)
+
+        return None
+
+    def find_explicit_video_containers(slide: dict) -> list:
+        containers = []
+        for key in VIDEO_CONTAINER_KEYS:
+            value = slide.get(key)
+            if value:
+                containers.append(value)
+
+        # Some TikTok variants hide video data one level deeper but keep obvious
+        # names like `videoResource` or `livePhoto`. Do a shallow scan by key name.
+        for key, value in slide.items():
+            key_lower = str(key).lower()
+            if (
+                value
+                and value not in containers
+                and (
+                    "video" in key_lower
+                    or "bitrate" in key_lower
+                    or "livephoto" in key_lower
+                    or "motionphoto" in key_lower
+                    or key in VIDEO_URL_KEYS
+                )
+            ):
+                containers.append(value)
+
+        return containers
+
+    def first_video_url_from_container(container) -> str | None:
+        candidates = collect_urls_from_container(container)
+        for candidate in candidates:
+            if is_video_like_url(candidate):
+                return candidate
+        return None
+
+    def pick_photo_url(slide: dict) -> str | None:
         photo_url = first_url_from_keys(
-            image,
+            slide,
             (
                 "imageURL",
                 "imageUrl",
@@ -567,15 +720,118 @@ def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
                 "url",
             ),
         )
-        thumbnail_url = first_url_from_keys(image, ("thumbnail", "thumb", "preview", "cover"))
+        if photo_url:
+            return photo_url
 
-        if not photo_url:
-            # Last-resort fallback for odd TikTok shapes. Keep only one URL per
-            # slide, not every watermark/thumbnail variant.
-            candidates = collect_urls_from_container(image)
-            photo_url = candidates[0] if candidates else None
+        # Last-resort fallback for odd TikTok shapes. Keep only one URL per slide,
+        # not every watermark/thumbnail variant.
+        candidates = collect_urls_from_container(slide)
+        return candidates[0] if candidates else None
 
-        add_pair(photo_url, thumbnail_url)
+    def pick_thumbnail_url(slide: dict) -> str | None:
+        # For video slides the thumbnail may live either directly on the slide or
+        # inside the nested video object.
+        direct = first_url_from_keys(
+            slide,
+            (
+                "thumbnail",
+                "thumb",
+                "preview",
+                "cover",
+                "coverUrl",
+                "originCover",
+                "dynamicCover",
+                "animatedCover",
+                "imageURL",
+                "imageUrl",
+                "display_image",
+                "displayImage",
+            ),
+        )
+        if direct:
+            return direct
+
+        video = slide.get("video") or slide.get("videoInfo") or slide.get("video_info") or slide.get("videoStruct")
+        if isinstance(video, dict):
+            return first_url_from_keys(
+                video,
+                (
+                    "cover",
+                    "coverUrl",
+                    "originCover",
+                    "dynamicCover",
+                    "animatedCover",
+                    "thumbnail",
+                    "thumb",
+                ),
+            )
+        return None
+
+    def pick_video_url(slide: dict) -> str | None:
+        # Prefer explicit video-address fields. A normal image slide usually only
+        # has imageURL/displayImage fields; a mixed/video slide should expose
+        # playAddr/downloadAddr/bitrateInfo or an obvious video/live-photo object.
+        explicit_containers = find_explicit_video_containers(slide)
+
+        for container in explicit_containers:
+            found = first_deep_url_from_keys(container, VIDEO_URL_KEYS, allow_image_fallback=True)
+            if found:
+                return found
+
+        for container in explicit_containers:
+            found = first_video_url_from_container(container)
+            if found:
+                return found
+
+        # Some structures mark the slide type but keep the URL at the slide root.
+        media_type_hint = str(
+            slide.get("type")
+            or slide.get("mediaType")
+            or slide.get("media_type")
+            or slide.get("slideType")
+            or slide.get("itemType")
+            or slide.get("subType")
+            or ""
+        ).lower()
+        if "video" in media_type_hint or "live" in media_type_hint or media_type_hint in {"2", "4", "video_slide"}:
+            found = first_deep_url_from_keys(slide, VIDEO_URL_KEYS, allow_image_fallback=True)
+            if found:
+                return found
+            return first_video_url_from_container(slide)
+
+        return None
+
+    def add_asset(media_type: str, remote_url: str | None, thumbnail_url: str | None = None) -> None:
+        if not remote_url or not is_usable_url(remote_url):
+            return
+        dedupe_key = f"{media_type}:{remote_url}"
+        if dedupe_key in seen_keys:
+            return
+        seen_keys.add(dedupe_key)
+        assets.append(
+            MediaAsset(
+                path=Path(""),
+                media_type=media_type,
+                remote_url=remote_url,
+                thumbnail_url=thumbnail_url or remote_url,
+            )
+        )
+
+    def add_slide(slide) -> None:
+        if isinstance(slide, str):
+            add_asset("photo", slide, slide)
+            return
+
+        if not isinstance(slide, dict):
+            return
+
+        video_url = pick_video_url(slide)
+        if video_url:
+            add_asset("video", video_url, pick_thumbnail_url(slide) or pick_photo_url(slide) or video_url)
+            return
+
+        photo_url = pick_photo_url(slide)
+        add_asset("photo", photo_url, pick_thumbnail_url(slide) or photo_url)
 
     raw_detail = info.get("aweme_detail") or info
 
@@ -585,17 +841,142 @@ def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
         if not images:
             continue
 
-        for image in images:
-            add_slide(image)
+        for slide in images:
+            add_slide(slide)
 
-        if pairs:
-            return pairs
+        if assets:
+            return assets
 
+    # Generic fallback for non-standard yt-dlp/TikTok shapes.
     for key in ("entries", "images"):
         for item in info.get(key) or []:
             add_slide(item)
 
-    return pairs
+    return assets
+
+
+
+def extract_inline_audio_asset(info: dict) -> MediaAsset | None:
+    """Return the slideshow music as a URL-only inline audio asset, if present.
+
+    TikTok photo mode usually stores the soundtrack in raw_detail["music"].playUrl.
+    This is not a per-slide video; it is the audio track for the whole slideshow.
+    Telegram can expose it as a separate InlineQueryResultAudio.
+    """
+    raw_detail = info.get("aweme_detail") or info
+    if not isinstance(raw_detail, dict):
+        return None
+
+    music = raw_detail.get("music") or raw_detail.get("music_info") or raw_detail.get("musicInfo") or {}
+    if not isinstance(music, dict):
+        return None
+
+    def first_string(*values) -> str | None:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def first_int(*values) -> int | None:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                number = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return None
+
+    def collect_urls(container) -> list[str]:
+        found: list[str] = []
+
+        def add(value) -> None:
+            if isinstance(value, str) and value.startswith(("http://", "https://")) and value not in found:
+                found.append(value)
+
+        def walk(value) -> None:
+            if isinstance(value, str):
+                add(value)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+            if not isinstance(value, dict):
+                return
+
+            for key in (
+                "playUrl",
+                "play_url",
+                "audioUrl",
+                "audioURL",
+                "audio_url",
+                "url",
+                "downloadUrl",
+                "mainUrl",
+                "backupUrl",
+            ):
+                walk(value.get(key))
+
+            for key in ("urlList", "url_list", "UrlList"):
+                walk(value.get(key))
+
+        walk(container)
+        return found
+
+    audio_url = first_string(
+        music.get("playUrl"),
+        music.get("play_url"),
+        music.get("audioUrl"),
+        music.get("audioURL"),
+        music.get("audio_url"),
+    )
+
+    if not audio_url:
+        for candidate in collect_urls(music):
+            lower = candidate.lower()
+            if "mime_type=audio" in lower or "audio" in lower or lower.endswith((".mp3", ".m4a", ".aac")):
+                audio_url = candidate
+                break
+
+    if not audio_url or not audio_url.startswith(("http://", "https://")):
+        return None
+
+    precise_duration = music.get("preciseDuration") or {}
+    if not isinstance(precise_duration, dict):
+        precise_duration = {}
+
+    title = first_string(music.get("title"), raw_detail.get("desc"), info.get("title"), "TikTok audio")
+    performer = first_string(music.get("authorName"), music.get("author"), music.get("owner"))
+    duration_seconds = first_int(
+        music.get("duration"),
+        music.get("shoot_duration"),
+        precise_duration.get("preciseDuration"),
+        precise_duration.get("preciseVideoDuration"),
+        precise_duration.get("preciseShootDuration"),
+    )
+
+    logger.info("TikTok inline slideshow audio prepared: title=%s duration=%s", title, duration_seconds)
+
+    return MediaAsset(
+        path=Path(""),
+        media_type="audio",
+        remote_url=audio_url,
+        thumbnail_url=None,
+        title=title,
+        performer=performer,
+        duration_seconds=duration_seconds,
+    )
+
+def extract_photo_url_pairs(info: dict) -> list[tuple[str, str]]:
+    """Backward-compatible wrapper for older local-photo code paths."""
+    return [
+        (asset.remote_url, asset.thumbnail_url or asset.remote_url)
+        for asset in extract_inline_album_assets(info)
+        if asset.media_type == "photo" and asset.remote_url
+    ]
 
 def detect_media_kind(info: dict) -> str:
     if extract_photo_urls(info):
@@ -709,6 +1090,150 @@ def download_photo_album_sync(url: str, output_dir: Path, info: dict) -> tuple[d
 
 
 
+def collect_interesting_media_paths(value, *, max_items: int = 200) -> list[dict]:
+    """Collect suspicious media-related paths from a TikTok JSON object.
+
+    This is diagnostic only. It helps understand rare slideshow variants where a
+    TikTok mobile app shows a slide as video, while web hydration exposes only a
+    still image in imagePost.images[].
+    """
+    interesting: list[dict] = []
+    seen: set[int] = set()
+
+    def should_keep_key(key: str) -> bool:
+        key_lower = key.lower()
+        return any(
+            token in key_lower
+            for token in (
+                "video",
+                "play",
+                "download",
+                "bitrate",
+                "bit_rate",
+                "live",
+                "motion",
+                "animated",
+                "animation",
+                "cover",
+                "url",
+                "uri",
+                "mime",
+            )
+        )
+
+    def should_keep_string(text: str) -> bool:
+        lower = text.lower()
+        return any(
+            token in lower
+            for token in (
+                ".mp4",
+                ".m3u8",
+                "video",
+                "tos-maliva",
+                "photomode",
+                "mime_type=video",
+                "mime_type=video_mp4",
+            )
+        )
+
+    def walk(current, path: str, parent_key: str = "") -> None:
+        if len(interesting) >= max_items:
+            return
+
+        if isinstance(current, (dict, list)):
+            current_id = id(current)
+            if current_id in seen:
+                return
+            seen.add(current_id)
+
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                nested_path = f"{path}.{key}" if path else str(key)
+                if should_keep_key(str(key)):
+                    preview = nested
+                    if isinstance(preview, (dict, list)):
+                        preview = type(preview).__name__
+                    interesting.append(
+                        {
+                            "path": nested_path,
+                            "key": str(key),
+                            "value_type": type(nested).__name__,
+                            "preview": preview if isinstance(preview, (str, int, float, bool)) or preview is None else repr(preview)[:300],
+                        }
+                    )
+                    if len(interesting) >= max_items:
+                        return
+                walk(nested, nested_path, str(key))
+        elif isinstance(current, list):
+            for index, nested in enumerate(current):
+                walk(nested, f"{path}[{index}]", parent_key)
+                if len(interesting) >= max_items:
+                    return
+        elif isinstance(current, str):
+            if should_keep_key(parent_key) or should_keep_string(current):
+                interesting.append(
+                    {
+                        "path": path,
+                        "key": parent_key,
+                        "value_type": "str",
+                        "preview": current[:1000],
+                    }
+                )
+
+    walk(value, "")
+    return interesting
+
+
+def dump_inline_slideshow_debug(info: dict, media_id: str, assets: list[MediaAsset]) -> None:
+    """Optionally dump slideshow JSON for rare TikTok mixed post formats.
+
+    Enable with TIKTOK_DEBUG_INLINE_SLIDES=1 in .env.
+
+    The compact dump remains small and focuses on imagePost.images[]. Enable
+    TIKTOK_DEBUG_INLINE_FULL=1 as well to write the whole aweme/itemStruct and a
+    media-hints index. That is needed when the mobile app displays a slide as a
+    video but web imagePost.images[] contains only imageURL/imageWidth/imageHeight.
+    """
+    if os.getenv("TIKTOK_DEBUG_INLINE_SLIDES", "0") != "1":
+        return
+
+    try:
+        raw_detail = info.get("aweme_detail") or info
+        image_post = raw_detail.get("imagePost") or raw_detail.get("image_post_info") or {}
+        images = image_post.get("images") or []
+        debug_payload = {
+            "media_id": media_id,
+            "root_keys": sorted(raw_detail.keys()) if isinstance(raw_detail, dict) else type(raw_detail).__name__,
+            "image_post_keys": sorted(image_post.keys()) if isinstance(image_post, dict) else type(image_post).__name__,
+            "asset_types": [asset.media_type for asset in assets],
+            "asset_urls": [getattr(asset, "remote_url", None) for asset in assets],
+            "slides": [
+                {
+                    "index": index,
+                    "keys": sorted(slide.keys()) if isinstance(slide, dict) else type(slide).__name__,
+                    "raw": slide,
+                }
+                for index, slide in enumerate(images, start=1)
+            ],
+        }
+        settings.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = settings.cache_dir / f"tiktok_inline_slides_{media_id}.json"
+        path.write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.warning("TikTok inline slideshow debug dump written: %s", path)
+
+        if os.getenv("TIKTOK_DEBUG_INLINE_FULL", "0") == "1":
+            full_payload = {
+                "media_id": media_id,
+                "asset_types": [asset.media_type for asset in assets],
+                "media_hints": collect_interesting_media_paths(raw_detail),
+                "raw_detail": raw_detail,
+            }
+            full_path = settings.cache_dir / f"tiktok_inline_full_{media_id}.json"
+            full_path.write_text(json.dumps(full_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.warning("TikTok inline full debug dump written: %s", full_path)
+    except Exception:
+        logger.exception("Failed to write TikTok inline slideshow debug dump")
+
 def probe_photo_album_links_sync(url: str) -> DownloadResult:
     """Probe a TikTok photo post and return remote photo/thumbnail URLs only.
 
@@ -738,27 +1263,26 @@ def probe_photo_album_links_sync(url: str) -> DownloadResult:
     ytdlp_url = re.sub(r"/photo/(\d+)", r"/video/\1", ytdlp_url, flags=re.IGNORECASE)
 
     info = probe_photo_info_sync(ytdlp_url, media_id, effective_url)
-    url_pairs = extract_photo_url_pairs(info)[: settings.max_photo_count]
+    visual_assets = extract_inline_album_assets(info)[: settings.max_photo_count]
+    audio_asset = extract_inline_audio_asset(info)
+    assets = ([audio_asset] if audio_asset else []) + visual_assets
+    dump_inline_slideshow_debug(info, media_id, assets)
 
-    if not url_pairs:
-        raise RuntimeError("TikTok webpage did not return inline photo URLs")
+    if not assets:
+        raise RuntimeError("TikTok webpage did not return inline slideshow media URLs")
 
-    logger.info("TikTok inline photo preview prepared %d remote photo URL(s)", len(url_pairs))
+    logger.info(
+        "TikTok inline slideshow preview prepared %d remote asset(s): %s",
+        len(assets),
+        ", ".join(asset.media_type for asset in assets),
+    )
 
     return DownloadResult(
         media_id=str(info.get("id") or media_id),
         kind="photo_album",
         source_url=effective_url,
         title=info.get("title"),
-        assets=[
-            MediaAsset(
-                path=Path(""),
-                media_type="photo",
-                remote_url=photo_url,
-                thumbnail_url=thumbnail_url,
-            )
-            for photo_url, thumbnail_url in url_pairs
-        ],
+        assets=assets,
     )
 
 async def to_thread_ytdlp(func, *args):

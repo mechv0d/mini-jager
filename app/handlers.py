@@ -7,9 +7,11 @@ from aiogram.filters import CommandStart
 from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
+    InlineQueryResultAudio,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
     InlineQueryResultPhoto,
+    InlineQueryResultVideo,
     InputTextMessageContent,
     Message,
     CallbackQuery,
@@ -84,46 +86,84 @@ def find_inline_ready_media(url: str) -> DownloadResult | None:
     return item[1]
 
 
-def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto]:
-    results: list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto] = []
+def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto | InlineQueryResultVideo | InlineQueryResultAudio]:
+    results: list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto | InlineQueryResultVideo | InlineQueryResultAudio] = []
 
-    for index, asset in enumerate(result.assets[:50], start=1):
+    visible_assets = [asset for asset in result.assets if asset.media_type in {"photo", "video"}]
+    visual_total = len(visible_assets)
+    visual_index = 0
+
+    for raw_index, asset in enumerate(result.assets[:50], start=1):
+        remote_url = getattr(asset, "remote_url", None)
+
+        if asset.media_type == "audio":
+            if not remote_url:
+                continue
+
+            results.append(
+                InlineQueryResultAudio(
+                    id=safe_inline_id(f"remote-audio:{result.media_id}_{raw_index}"),
+                    audio_url=remote_url,
+                    title=getattr(asset, "title", None) or result.title or "TikTok audio",
+                    performer=getattr(asset, "performer", None),
+                    audio_duration=getattr(asset, "duration_seconds", None),
+                    caption=settings.photo_caption_template.format(url=result.source_url),
+                )
+            )
+            continue
+
+        if asset.media_type in {"photo", "video"}:
+            visual_index += 1
+
         caption = (
             settings.photo_caption_template.format(url=result.source_url)
-            if index == 1
+            if visual_index == 1
             else None
         )
 
-        if asset.telegram_file_id:
+        if asset.telegram_file_id and asset.media_type == "photo":
             results.append(
                 InlineQueryResultCachedPhoto(
-                    id=safe_inline_id(f"cached:{result.media_id}_{index}"),
+                    id=safe_inline_id(f"cached-photo:{result.media_id}_{visual_index}"),
                     photo_file_id=asset.telegram_file_id,
-                    title=f"Photo {index}",
-                    description=f"Фото {index} из {len(result.assets)}",
+                    title=f"Photo {visual_index}",
+                    description=f"Фото {visual_index} из {visual_total}",
                     caption=caption,
                 )
             )
             continue
 
-        photo_url = getattr(asset, "remote_url", None)
-        thumbnail_url = getattr(asset, "thumbnail_url", None) or photo_url
-        if not photo_url or not thumbnail_url:
+        thumbnail_url = getattr(asset, "thumbnail_url", None) or remote_url
+        if not remote_url or not thumbnail_url:
             continue
 
-        results.append(
-            InlineQueryResultPhoto(
-                id=safe_inline_id(f"remote:{result.media_id}_{index}"),
-                photo_url=photo_url,
-                thumbnail_url=thumbnail_url,
-                title=f"Photo {index}",
-                description=f"Фото {index} из {len(result.assets)}",
-                caption=caption,
+        if asset.media_type == "video":
+            results.append(
+                InlineQueryResultVideo(
+                    id=safe_inline_id(f"remote-video:{result.media_id}_{visual_index}"),
+                    video_url=remote_url,
+                    mime_type="video/mp4",
+                    thumbnail_url=thumbnail_url,
+                    title=f"Video {visual_index}",
+                    description=f"Видео {visual_index} из {visual_total}",
+                    caption=caption,
+                )
             )
-        )
+            continue
+
+        if asset.media_type == "photo":
+            results.append(
+                InlineQueryResultPhoto(
+                    id=safe_inline_id(f"remote-photo:{result.media_id}_{visual_index}"),
+                    photo_url=remote_url,
+                    thumbnail_url=thumbnail_url,
+                    title=f"Photo {visual_index}",
+                    description=f"Фото {visual_index} из {visual_total}",
+                    caption=caption,
+                )
+            )
 
     return results
-
 
 def is_photo_effective_url(url: str) -> bool:
     return is_tiktok_photo_url(url) or "/photo/" in url.lower()
