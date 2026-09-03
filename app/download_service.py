@@ -20,6 +20,7 @@ from app.cache_service import (
     put_cache,
 )
 from app.config import settings
+from app.lang import t
 from app.models import DownloadResult, MediaAsset, PublicBotError
 from app.url_utils import (
     is_tiktok_photo_url,
@@ -38,23 +39,14 @@ def classify_download_error(exc: Exception) -> str:
     lower = text.lower()
 
     if "your ip address is blocked" in lower:
-        return (
-            "TikTok заблокировал текущий IP-адрес. "
-            "Проверь TIKTOK_PROXY в .env или выбери другой proxy/VPN endpoint."
-        )
+        return t.ip_blocked
 
     if "connectionrefusederror" in lower or "connection refused" in lower or "winerror 10061" in lower:
         proxy_hint = f" ({settings.tiktok_proxy})" if settings.tiktok_proxy else ""
-        return (
-            f"не удалось подключиться к TIKTOK_PROXY{proxy_hint}. "
-            "Проверь, что proxy/VPN запущен и адрес в .env указан верно."
-        )
+        return t.proxy_connection_failed.format(proxy_hint=proxy_hint)
 
     if "failed to parse json" in lower:
-        return (
-            "TikTok API вернул пустой или невалидный ответ. "
-            "Проверь TIKTOK_PROXY/VPN и повтори запрос."
-        )
+        return t.tiktok_invalid_json
 
     http_match = re.search(r"HTTP Error\s+(\d{3})|status code\s+(\d{3})|HTTP\s+(\d{3})", text)
     if http_match:
@@ -62,9 +54,9 @@ def classify_download_error(exc: Exception) -> str:
         return f"HTTP {code}: {text[:500]}"
 
     if "timed out" in lower or "timeout" in lower:
-        return f"таймаут: {text[:500]}"
+        return t.download_timeout.format(error=text[:500])
 
-    return f"внутренняя ошибка скачивания: {text[:500]}"
+    return t.download_internal_error.format(error=text[:500])
 
 
 def ytdlp_base_options() -> dict:
@@ -1299,7 +1291,7 @@ async def get_or_download_media(url: str) -> DownloadResult:
     logger.warning("ACTIVE URL: %s", url)
 
     if not is_tiktok_url(url):
-        raise PublicBotError("невалидная ссылка: поддерживаются только ссылки TikTok")
+        raise PublicBotError(t.invalid_tiktok_url)
 
     original_url = url
 
@@ -1384,8 +1376,10 @@ async def get_or_download_media(url: str) -> DownloadResult:
                     shutil.rmtree(output_dir, ignore_errors=True)
 
                 raise PublicBotError(
-                    f"фото слишком большое: {oversized[0].stat().st_size // 1024 // 1024} MB, "
-                    f"лимит {settings.max_photo_size_bytes // 1024 // 1024} MB"
+                    t.photo_too_large.format(
+                        size_mb=oversized[0].stat().st_size // 1024 // 1024,
+                        limit_mb=settings.max_photo_size_bytes // 1024 // 1024
+                    )
                 )
 
             result = DownloadResult(
@@ -1411,8 +1405,10 @@ async def get_or_download_media(url: str) -> DownloadResult:
                 shutil.rmtree(output_dir, ignore_errors=True)
 
             raise PublicBotError(
-                f"видео слишком большое: {path.stat().st_size // 1024 // 1024} MB, "
-                f"лимит {settings.max_video_size_bytes // 1024 // 1024} MB"
+                t.video_too_large.format(
+                    size_mb=path.stat().st_size // 1024 // 1024,
+                    limit_mb=settings.max_video_size_bytes // 1024 // 1024
+                )
             )
 
         result = DownloadResult(
@@ -1435,5 +1431,5 @@ async def get_or_download_media(url: str) -> DownloadResult:
 async def get_or_download_video(url: str) -> DownloadResult:
     result = await get_or_download_media(url)
     if result.kind != "video":
-        raise PublicBotError("ссылка ведёт на фотоальбом, а ожидалось видео")
+        raise PublicBotError(t.expected_video_got_album)
     return result

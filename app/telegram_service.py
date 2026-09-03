@@ -8,6 +8,7 @@ from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from app.cache_service import update_cache_asset_file_id, update_cache_telegram_file_id
 from app.config import settings
+from app.lang import t
 from app.models import DownloadResult, PublicBotError
 
 logger = logging.getLogger("ttsavefrom_bot.telegram")
@@ -27,21 +28,17 @@ async def safe_delete(message: Message | None) -> None:
 
 def public_error_message(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
-        return f"таймаут {settings.download_timeout_seconds} секунд"
+        return t.timeout_seconds.format(seconds=settings.download_timeout_seconds)
 
     if isinstance(exc, PublicBotError):
         return exc.message
 
-    return f"внутренняя ошибка: {type(exc).__name__}: {str(exc)[:500]}"
+    return t.internal_error.format(type=type(exc).__name__, message=str(exc)[:500])
 
 
 def dump_chat_id() -> int | str:
     if not settings.dump_chat_id:
-        raise PublicBotError(
-            "внутренняя ошибка: DUMP_CHAT_ID не задан. "
-            "Для inline-режима нужен служебный чат/канал, куда бот загрузит файл "
-            "и получит Telegram file_id."
-        )
+        raise PublicBotError(t.dump_chat_id_missing_file)
 
     return int(settings.dump_chat_id) if settings.dump_chat_id.lstrip("-").isdigit() else settings.dump_chat_id
 
@@ -55,7 +52,7 @@ async def send_video_without_caption(message: Message, result: DownloadResult) -
     last_error: Exception | None = None
     asset = result.assets[0] if result.assets else None
     if not asset:
-        raise PublicBotError("внутренняя ошибка: у видео нет файла")
+        raise PublicBotError(t.video_has_no_file)
 
     for attempt in range(1, settings.telegram_upload_retries + 1):
         try:
@@ -99,13 +96,13 @@ async def send_video_without_caption(message: Message, result: DownloadResult) -
             raise
 
     raise PublicBotError(
-        f"ошибка отправки видео в Telegram после {settings.telegram_upload_retries} попыток: {last_error}"
+        t.video_upload_failed.format(retries=settings.telegram_upload_retries, error=last_error)
     )
 
 
 async def send_photo_album(message: Message, result: DownloadResult) -> None:
     if not result.assets:
-        raise PublicBotError("внутренняя ошибка: у фотоальбома нет файлов")
+        raise PublicBotError(t.album_has_no_files)
 
     caption = settings.photo_caption_template.format(url=result.source_url)
     chunk_size = max(2, min(settings.photo_album_chunk_size, 10))
@@ -155,23 +152,19 @@ async def send_download_result(message: Message, result: DownloadResult) -> None
         await send_photo_album(message, result)
         return
 
-    raise PublicBotError(f"внутренняя ошибка: неизвестный тип медиа {result.kind}")
+    raise PublicBotError(t.unknown_media_kind.format(kind=result.kind))
 
 
 async def ensure_telegram_file_id(bot: Bot, result: DownloadResult) -> str:
     asset = result.assets[0] if result.assets else None
     if not asset:
-        raise PublicBotError("внутренняя ошибка: у видео нет файла")
+        raise PublicBotError(t.video_has_no_file)
 
     if asset.telegram_file_id:
         return asset.telegram_file_id
 
     if not settings.dump_chat_id:
-        raise PublicBotError(
-            "внутренняя ошибка: DUMP_CHAT_ID не задан. "
-            "Для inline-режима нужен служебный чат/канал, куда бот загрузит видео "
-            "и получит Telegram file_id."
-        )
+        raise PublicBotError(t.dump_chat_id_missing_video)
 
     sent = await bot.send_video(
         chat_id=dump_chat_id(),
@@ -182,7 +175,7 @@ async def ensure_telegram_file_id(bot: Bot, result: DownloadResult) -> str:
     )
 
     if not sent.video or not sent.video.file_id:
-        raise PublicBotError("внутренняя ошибка: Telegram не вернул video.file_id")
+        raise PublicBotError(t.telegram_no_video_file_id)
 
     asset.telegram_file_id = sent.video.file_id
     await update_cache_telegram_file_id(result.media_id, sent.video.file_id)
@@ -205,7 +198,7 @@ async def ensure_photo_file_ids(bot: Bot, result: DownloadResult) -> DownloadRes
         )
 
         if not sent.photo:
-            raise PublicBotError("внутренняя ошибка: Telegram не вернул photo.file_id")
+            raise PublicBotError(t.telegram_no_photo_file_id)
 
         asset.telegram_file_id = sent.photo[-1].file_id
         await update_cache_asset_file_id(result.media_id, index, sent.photo[-1].file_id)

@@ -55,8 +55,8 @@ pip install -U -r requirements.txt
 Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/tiktok-video-downloader-bot.git
-cd tiktok-video-downloader-bot
+git clone https://github.com/mechv0d/mini-jager.git
+cd mini-jager
 ```
 
 Create a virtual environment:

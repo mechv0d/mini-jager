@@ -38,6 +38,7 @@ from app.telegram_service import (
     safe_delete,
     send_download_result,
 )
+from app.lang import t
 from app.url_utils import (
     extract_tiktok_url,
     is_tiktok_photo_url,
@@ -104,7 +105,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                 InlineQueryResultAudio(
                     id=safe_inline_id(f"remote-audio:{result.media_id}_{raw_index}"),
                     audio_url=remote_url,
-                    title=getattr(asset, "title", None) or result.title or "TikTok audio",
+                    title=getattr(asset, "title", None) or result.title or t.inline_audio_title,
                     performer=getattr(asset, "performer", None),
                     audio_duration=getattr(asset, "duration_seconds", None),
                     caption=settings.photo_caption_template.format(url=result.source_url),
@@ -126,7 +127,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                 InlineQueryResultCachedPhoto(
                     id=safe_inline_id(f"cached-photo:{result.media_id}_{visual_index}"),
                     photo_file_id=asset.telegram_file_id,
-                    title=f"Photo {visual_index}",
+                    title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
                     caption=caption,
                 )
@@ -144,7 +145,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     video_url=remote_url,
                     mime_type="video/mp4",
                     thumbnail_url=thumbnail_url,
-                    title=f"Video {visual_index}",
+                    title=t.inline_video_slide_title.format(index=visual_index),
                     description=f"Видео {visual_index} из {visual_total}",
                     caption=caption,
                 )
@@ -157,7 +158,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     id=safe_inline_id(f"remote-photo:{result.media_id}_{visual_index}"),
                     photo_url=remote_url,
                     thumbnail_url=thumbnail_url,
-                    title=f"Photo {visual_index}",
+                    title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
                     caption=caption,
                 )
@@ -215,7 +216,7 @@ def inline_loading_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Загрузка выполняется",
+                    text=t.inline_loading_button,
                     callback_data="inline_loading_status",
                 )
             ]
@@ -238,8 +239,7 @@ async def on_startup() -> None:
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     await message.answer(
-        "Привет! Отправь ссылку на TikTok-видео, и я отправлю его сюда.\n\n"
-        f"Также можно использовать inline-режим: @{settings.bot_username} https://www.tiktok.com/..."
+        t.start.format(bot_username=settings.bot_username)
     )
 
 
@@ -249,7 +249,7 @@ async def message_handler(message: Message) -> None:
     if not url:
         return
 
-    loading = await message.answer("Загрузка началась")
+    loading = await message.answer(t.loading_started)
 
     try:
         result = await asyncio.wait_for(
@@ -265,7 +265,7 @@ async def message_handler(message: Message) -> None:
         logger.exception("Failed to handle message download: %s", error_text)
 
         await safe_delete(loading)
-        await message.answer(f"Ошибка: {error_text}")
+        await message.answer(t.error.format(error=error_text))
 
 
 @dp.inline_query()
@@ -275,10 +275,10 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
     if not url:
         result = InlineQueryResultArticle(
             id="help",
-            title="Вставь ссылку TikTok",
-            description=f"Пример: @{settings.bot_username} https://www.tiktok.com/...",
+            title=t.inline_help_title,
+            description=t.inline_help_description.format(bot_username=settings.bot_username),
             input_message_content=InputTextMessageContent(
-                message_text="Пришли ссылку на TikTok-видео."
+                message_text=t.inline_help_message
             ),
         )
         await inline_query.answer([result], cache_time=0, is_personal=True)
@@ -292,8 +292,8 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
         result = InlineQueryResultCachedVideo(
             id=safe_inline_id(cached.media_id),
             video_file_id=cached.assets[0].telegram_file_id,
-            title="Отправить видео",
-            description="Видео готово",
+            title=t.inline_send_video_title,
+            description=t.inline_video_ready,
             caption=None,
         )
 
@@ -331,8 +331,8 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
                 [
                     build_inline_error_result(
                         url,
-                        "Не удалось подготовить фото",
-                        "TikTok не отдал ссылки на фото достаточно быстро. Повтори inline-запрос через секунду.",
+                        t.inline_photo_prepare_failed_title,
+                        t.inline_photo_prepare_failed_description.format(error="TikTok не отдал ссылки на фото достаточно быстро. Повтори inline-запрос через секунду."),
                     )
                 ],
                 cache_time=0,
@@ -362,10 +362,10 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
     # Only video/unknown TikTok links use the async placeholder flow.
     result = InlineQueryResultArticle(
         id=inline_loading_result_id(url),
-        title="Скачать TikTok",
-        description="Видео появится после загрузки",
+        title=t.inline_download_title,
+        description=t.inline_download_description,
         input_message_content=InputTextMessageContent(
-            message_text="Загрузка началась. Видео появится здесь автоматически."
+            message_text=t.inline_download_message
         ),
         reply_markup=inline_loading_keyboard(),
     )
@@ -401,7 +401,7 @@ async def chosen_inline_result_handler(chosen_result: ChosenInlineResult, bot: B
 
 @dp.callback_query(F.data == "inline_loading_status")
 async def inline_loading_status_handler(callback: CallbackQuery) -> None:
-    await callback.answer("Медиа ещё загружается. Сообщение обновится автоматически.")
+    await callback.answer(t.inline_loading_callback)
 
 async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -> None:
     try:
@@ -425,7 +425,7 @@ async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -
                     caption=(
                         settings.photo_caption_template.format(url=result.source_url)
                         if len(result.assets) == 1
-                        else "Фотоальбом готов. Для выбора всех фото повторите inline-запрос."
+                        else t.inline_album_ready_retry
                     ),
                 ),
                 reply_markup=None,
@@ -454,7 +454,7 @@ async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -
         try:
             await bot.edit_message_text(
                 inline_message_id=inline_message_id,
-                text=f"Ошибка: {error_text}",
+                text=t.error.format(error=error_text),
                 reply_markup=None,
             )
         except Exception:
