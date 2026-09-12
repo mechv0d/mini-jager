@@ -28,7 +28,8 @@ class Settings:
     photo_caption_template: str = os.getenv("PHOTO_CAPTION_TEMPLATE", t.photo_caption)
     telegram_upload_timeout_seconds: int = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", "120"))
     telegram_upload_retries: int = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
-    tiktok_proxy = os.getenv("TIKTOK_PROXY", "").strip() or None
+    tikwm_api_key: str = os.getenv("TIKWM_API_KEY", "")
+    tikwm_hd_quality: bool = os.getenv("TIKWM_HD_QUALITY", "1") == "1"
     telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
 
     @property

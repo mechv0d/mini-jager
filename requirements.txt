@@ -1,4 +1,3 @@
 aiogram>=3.22.0
 aiohttp>=3.9.0
-yt-dlp>=2026.08.19
 python-dotenv>=1.0.1

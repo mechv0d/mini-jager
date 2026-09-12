@@ -26,9 +26,7 @@ from app.cache_service import cache_heartbeat, ensure_cache_dir, find_cached_by_
 from app.config import settings
 from app.download_service import (
     get_or_download_media,
-    probe_photo_album_links_sync,
-    resolve_tiktok_redirect_sync,
-    to_thread_ytdlp,
+    probe_inline_media,
 )
 from app.models import DownloadResult
 from app.telegram_service import (
@@ -41,9 +39,7 @@ from app.telegram_service import (
 from app.lang import t
 from app.url_utils import (
     extract_tiktok_url,
-    is_tiktok_photo_url,
     normalize_url,
-    parse_video_id_from_url,
     safe_inline_id,
 )
 
@@ -52,9 +48,6 @@ logger = logging.getLogger("ttsavefrom_bot.handlers")
 dp = Dispatcher()
 
 _INLINE_READY_TTL_SECONDS = 30 * 60
-# Telegram clients usually stop waiting for an inline answer quickly.
-# For photo posts we only probe TikTok URLs and return InlineQueryResultPhoto
-# with thumbnail_url/photo_url. We do not upload all HD photos before answering.
 _INLINE_PHOTO_PREFETCH_TIMEOUT_SECONDS = 9
 _inline_ready_media: dict[str, tuple[float, DownloadResult]] = {}
 
@@ -64,10 +57,6 @@ def inline_loading_result_id(url: str) -> str:
 
 
 def remember_inline_ready_media(result: DownloadResult, *urls: str) -> None:
-    """
-    Keeps Telegram file_id values available for repeated inline queries even when
-    ENABLE_CACHE=0. This is process-local and is lost after bot restart.
-    """
     now = time.time()
     for raw_url in (result.source_url, *urls):
         if raw_url:
@@ -166,19 +155,6 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
 
     return results
 
-def is_photo_effective_url(url: str) -> bool:
-    return is_tiktok_photo_url(url) or "/photo/" in url.lower()
-
-
-async def resolve_inline_tiktok_url(url: str) -> str:
-    """Resolve short TikTok links once before deciding inline behavior."""
-    effective_url = normalize_url(url)
-    if parse_video_id_from_url(effective_url) is None:
-        resolved_url = await to_thread_ytdlp(resolve_tiktok_redirect_sync, effective_url)
-        if resolved_url:
-            effective_url = normalize_url(resolved_url)
-    return effective_url
-
 
 def build_inline_error_result(url: str, title: str, description: str) -> InlineQueryResultArticle:
     return InlineQueryResultArticle(
@@ -187,28 +163,6 @@ def build_inline_error_result(url: str, title: str, description: str) -> InlineQ
         description=description,
         input_message_content=InputTextMessageContent(message_text=description),
     )
-
-
-async def try_prepare_inline_photo_album(bot: Bot, url: str) -> DownloadResult | None:
-    """
-    If the inline query points to a TikTok photo post, prepare URL-based inline
-    photo results immediately. This is the @pics-like path: Telegram receives a
-    small thumbnail_url for the grid and a photo_url for the final HD message.
-
-    No DUMP_CHAT_ID upload happens here, so the user does not wait 5-6 seconds
-    for every HD photo to be uploaded before seeing choices.
-    """
-    effective_url = await resolve_inline_tiktok_url(url)
-
-    if not is_photo_effective_url(effective_url):
-        return None
-
-    result = await to_thread_ytdlp(probe_photo_album_links_sync, effective_url)
-    if result.kind != "photo_album":
-        return None
-
-    remember_inline_ready_media(result, url, effective_url)
-    return result
 
 
 def inline_loading_keyboard() -> InlineKeyboardMarkup:
@@ -252,9 +206,10 @@ async def message_handler(message: Message) -> None:
     loading = await message.answer(t.loading_started)
 
     try:
+        # Даём чуть больше времени, так как API + скачивание бинарников может занять время
         result = await asyncio.wait_for(
             get_or_download_media(url),
-            timeout=settings.download_timeout_seconds,
+            timeout=settings.download_timeout_seconds + 15,
         )
 
         await safe_delete(loading)
@@ -307,59 +262,24 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
             await inline_query.answer(results, cache_time=0, is_personal=True)
             return
 
-    # For TikTok photo/slideshow links do NOT return the video placeholder.
-    # Inline results cannot be updated later, so the first answer must already
-    # contain InlineQueryResultPhoto items with thumbnail_url/photo_url.
+    # Если нет в кэше, делаем быстрый запрос к API, чтобы узнать, видео это или слайдшоу
     try:
-        effective_url = await asyncio.wait_for(
-            resolve_inline_tiktok_url(url),
-            timeout=min(4, _INLINE_PHOTO_PREFETCH_TIMEOUT_SECONDS),
+        prepared = await asyncio.wait_for(
+            probe_inline_media(url),
+            timeout=_INLINE_PHOTO_PREFETCH_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        logger.warning("Inline TikTok URL resolve failed: %s", public_error_message(exc), exc_info=True)
-        effective_url = normalize_url(url)
+        logger.warning("Inline media probe failed: %s", public_error_message(exc), exc_info=True)
+        prepared = None
 
-    if is_photo_effective_url(effective_url):
-        try:
-            prepared = await asyncio.wait_for(
-                try_prepare_inline_photo_album(bot, effective_url),
-                timeout=_INLINE_PHOTO_PREFETCH_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning("Inline photo prefetch failed: %s", public_error_message(exc), exc_info=True)
-            await inline_query.answer(
-                [
-                    build_inline_error_result(
-                        url,
-                        t.inline_photo_prepare_failed_title,
-                        t.inline_photo_prepare_failed_description.format(error="TikTok не отдал ссылки на фото достаточно быстро. Повтори inline-запрос через секунду."),
-                    )
-                ],
-                cache_time=0,
-                is_personal=True,
-            )
+    if prepared and prepared.kind == "photo_album":
+        remember_inline_ready_media(prepared, url)
+        results = build_photo_album_inline_results(prepared)
+        if results:
+            await inline_query.answer(results, cache_time=0, is_personal=True)
             return
 
-        if prepared and prepared.kind == "photo_album":
-            results = build_photo_album_inline_results(prepared)
-            if results:
-                await inline_query.answer(results, cache_time=0, is_personal=True)
-                return
-
-        await inline_query.answer(
-            [
-                build_inline_error_result(
-                    url,
-                    "Фото не найдены",
-                    "Ссылка похожа на TikTok slideshow, но фото URL не были найдены.",
-                )
-            ],
-            cache_time=0,
-            is_personal=True,
-        )
-        return
-
-    # Only video/unknown TikTok links use the async placeholder flow.
+    # Если это видео (или API упал), используем заглушку, чтобы бот скачал и перезалил его в Telegram
     result = InlineQueryResultArticle(
         id=inline_loading_result_id(url),
         title=t.inline_download_title,
@@ -372,6 +292,7 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
 
     await inline_query.answer([result], cache_time=0, is_personal=True)
 
+
 @dp.chosen_inline_result()
 async def chosen_inline_result_handler(chosen_result: ChosenInlineResult, bot: Bot) -> None:
     url = extract_tiktok_url(chosen_result.query)
@@ -380,8 +301,6 @@ async def chosen_inline_result_handler(chosen_result: ChosenInlineResult, bot: B
         return
 
     if chosen_result.result_id != inline_loading_result_id(url):
-        # The user selected an already prepared cached photo/video result.
-        # Do not start a new download job for these selections.
         return
 
     if not chosen_result.inline_message_id:
@@ -407,7 +326,7 @@ async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -
     try:
         result = await asyncio.wait_for(
             get_or_download_media(url),
-            timeout=settings.download_timeout_seconds,
+            timeout=settings.download_timeout_seconds + 15,
         )
 
         if result.kind == "photo_album":
