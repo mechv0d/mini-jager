@@ -25,7 +25,7 @@ async def fetch_tiktok_media_data(url: str) -> dict:
         "x-tikwmapi-key": settings.tikwm_api_key
     }
     
-    timeout = ClientTimeout(total=settings.download_timeout)
+    timeout = ClientTimeout(total=settings.download_timeout_seconds)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
