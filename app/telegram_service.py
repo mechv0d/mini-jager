@@ -53,6 +53,8 @@ async def send_video_without_caption(message: Message, result: DownloadResult) -
     asset = result.assets[0] if result.assets else None
     if not asset:
         raise PublicBotError(t.video_has_no_file)
+    if not asset.path.exists():
+        raise PublicBotError("Файл повреждён или не был скачан")
 
     for attempt in range(1, settings.telegram_upload_retries + 1):
         try:
@@ -103,6 +105,10 @@ async def send_video_without_caption(message: Message, result: DownloadResult) -
 async def send_photo_album(message: Message, result: DownloadResult) -> None:
     if not result.assets:
         raise PublicBotError(t.album_has_no_files)
+    
+    for asset in result.assets:
+        if not asset.path.exists():
+            raise PublicBotError("Файл повреждён или не был скачан")
 
     caption = settings.photo_caption_template.format(url=result.source_url)
     chunk_size = max(2, min(settings.photo_album_chunk_size, 10))

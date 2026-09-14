@@ -171,11 +171,12 @@ async def get_or_download_media(url: str) -> DownloadResult:
         if cached:
             return cached
 
-        output_dir = (
-            settings.cache_dir
-            if settings.enable_cache
-            else Path(tempfile.mkdtemp(prefix="ttbot_"))
-        )
+        if settings.enable_cache:
+            output_dir = settings.cache_dir
+        else:
+            # Используем постоянную директорию внутри проекта, а не /tmp
+            output_dir = Path.cwd() / ".temp_downloads"
+            output_dir.mkdir(exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         timeout = aiohttp.ClientTimeout(total=settings.download_timeout_seconds)
@@ -269,3 +270,17 @@ async def get_or_download_video(url: str) -> DownloadResult:
     if result.kind != "video":
         raise PublicBotError(t.expected_video_got_album)
     return result
+
+def cleanup_temp_dir(result: DownloadResult) -> None:
+    if result.temp_dir and result.temp_dir.exists():
+        # Удаляем только если это наша временная папка, а не кэш
+        if result.temp_dir.name == ".temp_downloads":
+            # Удаляем только файлы из этого запуска, а не всю папку
+            for asset in result.assets:
+                try:
+                    if asset.path.exists():
+                        asset.path.unlink()
+                except Exception:
+                    pass
+        else:
+            shutil.rmtree(result.temp_dir, ignore_errors=True)
