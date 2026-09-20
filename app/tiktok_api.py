@@ -18,8 +18,7 @@ async def fetch_tiktok_media_data(url: str) -> dict:
     api_url = "https://api.tikwmapi.com/"
     
     params = {"url": url}
-    if settings.tikwm_hd_quality:
-        params["hd"] = "1"
+    params["hd"] = "0"
         
     headers = {
         "x-tikwmapi-key": settings.tikwm_api_key

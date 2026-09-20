@@ -29,7 +29,7 @@ class Settings:
     telegram_upload_timeout_seconds: int = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", "120"))
     telegram_upload_retries: int = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
     tikwm_api_key: str = os.getenv("TIKWM_API_KEY", "")
-    tikwm_hd_quality: bool = os.getenv("TIKWM_HD_QUALITY", "1") == "1"
+    tikwm_hd_quality: bool = os.getenv("TIKWM_HD_QUALITY", "0") == "1"
     telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
 
     @property
