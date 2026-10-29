@@ -90,7 +90,10 @@ def find_inline_ready_media(url: str) -> DownloadResult | None:
     return item[1]
 
 
-def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto | InlineQueryResultVideo | InlineQueryResultAudio]:
+def build_photo_album_inline_results(
+    result: DownloadResult,
+    caption: str | None,
+) -> list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto | InlineQueryResultVideo | InlineQueryResultAudio]:
     results: list[InlineQueryResultCachedPhoto | InlineQueryResultPhoto | InlineQueryResultVideo | InlineQueryResultAudio] = []
 
     visible_assets = [asset for asset in result.assets if asset.media_type in {"photo", "video"}]
@@ -111,7 +114,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     title=getattr(asset, "title", None) or result.title or t.inline_audio_title,
                     performer=getattr(asset, "performer", None),
                     audio_duration=getattr(asset, "duration_seconds", None),
-                    caption=user_caption(),
+                    caption=caption,
                     parse_mode=None,
                 )
             )
@@ -120,7 +123,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
         if asset.media_type in {"photo", "video"}:
             visual_index += 1
 
-        caption = user_caption() if visual_index == 1 else None
+        visual_caption = caption if visual_index == 1 else None
 
         if asset.telegram_file_id and asset.media_type == "photo":
             results.append(
@@ -129,7 +132,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     photo_file_id=asset.telegram_file_id,
                     title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
-                    caption=caption,
+                    caption=visual_caption,
                     parse_mode=None,
                 )
             )
@@ -148,7 +151,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     thumbnail_url=thumbnail_url,
                     title=t.inline_video_slide_title.format(index=visual_index),
                     description=f"Видео {visual_index} из {visual_total}",
-                    caption=caption,
+                    caption=visual_caption,
                     parse_mode=None,
                 )
             )
@@ -162,7 +165,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     thumbnail_url=thumbnail_url,
                     title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
-                    caption=caption,
+                    caption=visual_caption,
                     parse_mode=None,
                 )
             )
@@ -297,7 +300,7 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
         return
 
     if cached and cached.kind == "photo_album":
-        results = build_photo_album_inline_results(cached)
+        results = build_photo_album_inline_results(cached, user_caption())
 
         if results:
             await inline_query.answer(results, cache_time=0, is_personal=True)
@@ -315,7 +318,7 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
 
     if prepared and prepared.kind == "photo_album":
         remember_inline_ready_media(prepared, url)
-        results = build_photo_album_inline_results(prepared)
+        results = build_photo_album_inline_results(prepared, user_caption())
         if results:
             await inline_query.answer(results, cache_time=0, is_personal=True)
             return
@@ -432,6 +435,7 @@ async def process_inline_video_job(
 
         await wait_for_inline_recipient(sender.id, chat_type)
         metadata = metadata_for_inline(sender, normalize_url(url), chat_type)
+        caption = user_caption()
 
         if result.kind == "photo_album":
             result = await asyncio.wait_for(
@@ -446,9 +450,12 @@ async def process_inline_video_job(
             remember_inline_ready_media(result, url)
             first_asset = result.assets[0]
 
-            caption = user_caption()
             if len(result.assets) > 1:
-                caption = f"{caption}\n\n{t.inline_album_ready_retry}"
+                caption = (
+                    f"{caption}\n\n{t.inline_album_ready_retry}"
+                    if caption
+                    else t.inline_album_ready_retry
+                )
 
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
@@ -476,7 +483,7 @@ async def process_inline_video_job(
             inline_message_id=inline_message_id,
             media=InputMediaVideo(
                 media=telegram_file_id,
-                caption=user_caption(),
+                caption=caption,
                 parse_mode=None,
                 supports_streaming=True,
             ),

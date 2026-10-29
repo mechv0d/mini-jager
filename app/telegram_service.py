@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import shutil
 
 from aiogram import Bot
@@ -44,7 +45,10 @@ def dump_chat_id() -> int | str:
     return int(settings.dump_chat_id) if settings.dump_chat_id.lstrip("-").isdigit() else settings.dump_chat_id
 
 
-def user_caption() -> str:
+def user_caption() -> str | None:
+    if random.random() >= settings.caption_chance_percent / 100:
+        return None
+
     return t.downloaded_via.format(bot_username=settings.bot_username)
 
 
@@ -213,13 +217,15 @@ async def upload_result_to_dump(
     raise PublicBotError(t.unknown_media_kind.format(kind=result.kind))
 
 
-async def send_video_with_caption(message: Message, result: DownloadResult) -> None:
+async def send_video_with_caption(
+    message: Message,
+    result: DownloadResult,
+    caption: str | None,
+) -> None:
     last_error: Exception | None = None
     asset = result.assets[0] if result.assets else None
     if not asset:
         raise PublicBotError(t.video_has_no_file)
-
-    caption = user_caption()
 
     for attempt in range(1, settings.telegram_upload_retries + 1):
         try:
@@ -258,7 +264,11 @@ async def send_video_with_caption(message: Message, result: DownloadResult) -> N
     )
 
 
-async def send_photo_album(message: Message, result: DownloadResult) -> None:
+async def send_photo_album(
+    message: Message,
+    result: DownloadResult,
+    caption: str | None,
+) -> None:
     if not result.assets:
         raise PublicBotError(t.album_has_no_files)
 
@@ -266,7 +276,6 @@ async def send_photo_album(message: Message, result: DownloadResult) -> None:
         if not asset.telegram_file_id and not asset.path.exists():
             raise PublicBotError("Файл повреждён или не был скачан")
 
-    caption = user_caption()
     chunk_size = max(2, min(settings.photo_album_chunk_size, 10))
 
     if len(result.assets) == 1:
@@ -320,12 +329,14 @@ async def send_download_result(
                     "sending the user copy without a dump record"
                 )
 
+        caption = user_caption()
+
         if result.kind == "video":
-            await send_video_with_caption(message, result)
+            await send_video_with_caption(message, result, caption)
             return
 
         if result.kind == "photo_album":
-            await send_photo_album(message, result)
+            await send_photo_album(message, result, caption)
             return
 
         raise PublicBotError(t.unknown_media_kind.format(kind=result.kind))
