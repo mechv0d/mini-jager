@@ -4,8 +4,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from app.lang import t
-
 load_dotenv()
 
 
@@ -25,7 +23,6 @@ class Settings:
     max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "35"))
     max_photo_size_bytes: int = int(os.getenv("MAX_PHOTO_SIZE_MB", "10")) * 1024 * 1024
     photo_album_chunk_size: int = int(os.getenv("PHOTO_ALBUM_CHUNK_SIZE", "10"))
-    photo_caption_template: str = os.getenv("PHOTO_CAPTION_TEMPLATE", t.photo_caption)
     telegram_upload_timeout_seconds: int = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", "120"))
     telegram_upload_retries: int = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
     tikwm_api_key: str = os.getenv("TIKWM_API_KEY", "")

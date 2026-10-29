@@ -14,6 +14,12 @@ class Lang:
         "и я отправлю медиа сюда.\n\n"
         "Также можно использовать inline-режим: @{bot_username} https://www.tiktok.com/..."
     )
+    # HTML-escaped: /help is sent with parse_mode=HTML, so angle brackets are
+    # displayed as text instead of being treated as Telegram tags.
+    help: str = (
+        "Привет, {name}! Отправь сюда ссылку или используй inline-режим "
+        "в любом чате: @{bot_username} &lt;ссылка&gt;"
+    )
     loading_started: str = "Загрузка началась"
 
     # Inline common
@@ -40,7 +46,21 @@ class Lang:
     inline_photo_prepare_failed_description: str = "{error}"
 
     # Captions
-    photo_caption: str = "Ссылка: {url}"
+    photo_caption: str = "Скачано с помощью @{bot_username}"
+    downloaded_via: str = "Скачано с помощью @{bot_username}"
+
+    # Dump chat metadata. This text must never be sent to regular users.
+    dump_caption: str = (
+        "Ссылка: {source_url}\n"
+        "Отправитель: {sender}\n"
+        "Получатель: {recipient}"
+    )
+    unknown_user: str = "неизвестный пользователь"
+    unknown_chat: str = "неизвестный чат"
+    inline_private_recipient: str = "другой пользователь (личный чат)"
+    inline_group_recipient: str = "групповой чат (id и имя недоступны)"
+    inline_channel_recipient: str = "канал (id и имя недоступны)"
+    inline_unknown_recipient: str = "неизвестный получатель"
 
     # Download errors
     invalid_tiktok_url: str = "невалидная ссылка: поддерживаются только ссылки TikTok"

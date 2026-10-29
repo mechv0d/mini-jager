@@ -1,9 +1,11 @@
 import asyncio
+import html
 import logging
 import time
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
@@ -28,13 +30,25 @@ from app.download_service import (
     get_or_download_media,
     probe_inline_media,
 )
+from app.dump_metadata import (
+    display_name,
+    get_inline_chat_type,
+    has_inline_recipient,
+    metadata_for_inline,
+    metadata_for_message,
+    remember_inline_query,
+    remember_via_bot_message,
+)
 from app.models import DownloadResult
 from app.telegram_service import (
+    cleanup_temp_dir,
     ensure_photo_file_ids,
     ensure_telegram_file_id,
     public_error_message,
     safe_delete,
     send_download_result,
+    upload_result_to_dump,
+    user_caption,
 )
 from app.lang import t
 from app.url_utils import (
@@ -97,7 +111,8 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     title=getattr(asset, "title", None) or result.title or t.inline_audio_title,
                     performer=getattr(asset, "performer", None),
                     audio_duration=getattr(asset, "duration_seconds", None),
-                    caption=settings.photo_caption_template.format(url=result.source_url),
+                    caption=user_caption(),
+                    parse_mode=None,
                 )
             )
             continue
@@ -105,11 +120,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
         if asset.media_type in {"photo", "video"}:
             visual_index += 1
 
-        caption = (
-            settings.photo_caption_template.format(url=result.source_url)
-            if visual_index == 1
-            else None
-        )
+        caption = user_caption() if visual_index == 1 else None
 
         if asset.telegram_file_id and asset.media_type == "photo":
             results.append(
@@ -119,6 +130,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
                     caption=caption,
+                    parse_mode=None,
                 )
             )
             continue
@@ -137,6 +149,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     title=t.inline_video_slide_title.format(index=visual_index),
                     description=f"Видео {visual_index} из {visual_total}",
                     caption=caption,
+                    parse_mode=None,
                 )
             )
             continue
@@ -150,6 +163,7 @@ def build_photo_album_inline_results(result: DownloadResult) -> list[InlineQuery
                     title=t.inline_photo_title.format(index=visual_index),
                     description=f"Фото {visual_index} из {visual_total}",
                     caption=caption,
+                    parse_mode=None,
                 )
             )
 
@@ -197,12 +211,32 @@ async def start_handler(message: Message) -> None:
     )
 
 
+@dp.message(Command("help"))
+async def help_handler(message: Message) -> None:
+    name = html.escape(display_name(message.from_user))
+    bot_username = html.escape(settings.bot_username)
+
+    await message.answer(
+        t.help.format(name=name, bot_username=bot_username),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(F.via_bot)
+async def via_bot_message_handler(message: Message) -> None:
+    # Inline results do not tell the bot which chat they were inserted into.
+    # Telegram sends a regular via_bot message in groups/channels, so remember
+    # that chat to make the dump metadata more accurate.
+    remember_via_bot_message(message)
+
+
 @dp.message(F.text)
-async def message_handler(message: Message) -> None:
+async def message_handler(message: Message, bot: Bot) -> None:
     url = extract_tiktok_url(message.text)
     if not url:
         return
 
+    metadata = metadata_for_message(message, url)
     loading = await message.answer(t.loading_started)
 
     try:
@@ -213,7 +247,7 @@ async def message_handler(message: Message) -> None:
         )
 
         await safe_delete(loading)
-        await send_download_result(message, result)
+        await send_download_result(bot, message, result, metadata)
 
     except Exception as exc:
         error_text = public_error_message(exc)
@@ -239,6 +273,12 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
         await inline_query.answer([result], cache_time=0, is_personal=True)
         return
 
+    remember_inline_query(
+        inline_query.from_user.id,
+        normalize_url(url),
+        inline_query.chat_type,
+    )
+
     cached = await find_cached_by_url(url)
     if not cached:
         cached = find_inline_ready_media(url)
@@ -249,7 +289,8 @@ async def inline_query_handler(inline_query: InlineQuery, bot: Bot) -> None:
             video_file_id=cached.assets[0].telegram_file_id,
             title=t.inline_send_video_title,
             description=t.inline_video_ready,
-            caption=None,
+            caption=user_caption(),
+            parse_mode=None,
         )
 
         await inline_query.answer([result], cache_time=0, is_personal=True)
@@ -300,7 +341,20 @@ async def chosen_inline_result_handler(chosen_result: ChosenInlineResult, bot: B
     if not url:
         return
 
+    normalized_url = normalize_url(url)
+    chat_type = get_inline_chat_type(chosen_result.from_user.id, normalized_url)
+
     if chosen_result.result_id != inline_loading_result_id(url):
+        # The media is already visible in the chat (cached or remote inline
+        # result). Record a copy with metadata in the dump chat in background.
+        asyncio.create_task(
+            record_inline_selection_in_dump(
+                bot=bot,
+                url=normalized_url,
+                sender=chosen_result.from_user,
+                chat_type=chat_type,
+            )
+        )
         return
 
     if not chosen_result.inline_message_id:
@@ -315,44 +369,105 @@ async def chosen_inline_result_handler(chosen_result: ChosenInlineResult, bot: B
             bot=bot,
             inline_message_id=chosen_result.inline_message_id,
             url=url,
+            sender=chosen_result.from_user,
+            chat_type=chat_type,
         )
     )
 
-@dp.callback_query(F.data == "inline_loading_status")
-async def inline_loading_status_handler(callback: CallbackQuery) -> None:
-    await callback.answer(t.inline_loading_callback)
 
-async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -> None:
+async def wait_for_inline_recipient(user_id: int, chat_type: str | None) -> None:
+    if chat_type not in {"sender", "group", "supergroup", "channel"}:
+        return
+
+    # The via_bot message with the destination chat can arrive right after
+    # chosen_inline_result. Give Telegram a moment to deliver it.
+    for _ in range(15):
+        if has_inline_recipient(user_id, chat_type):
+            return
+        await asyncio.sleep(0.1)
+
+
+async def record_inline_selection_in_dump(
+    bot: Bot,
+    url: str,
+    sender,
+    chat_type: str | None,
+) -> None:
+    result: DownloadResult | None = None
+
     try:
         result = await asyncio.wait_for(
             get_or_download_media(url),
             timeout=settings.download_timeout_seconds + 15,
         )
 
+        await wait_for_inline_recipient(sender.id, chat_type)
+        metadata = metadata_for_inline(sender, url, chat_type)
+        await upload_result_to_dump(bot, result, metadata)
+    except Exception:
+        logger.exception("Failed to record inline media in dump chat")
+    finally:
+        if result is not None:
+            cleanup_temp_dir(result)
+
+
+@dp.callback_query(F.data == "inline_loading_status")
+async def inline_loading_status_handler(callback: CallbackQuery) -> None:
+    await callback.answer(t.inline_loading_callback)
+
+async def process_inline_video_job(
+    bot: Bot,
+    inline_message_id: str,
+    url: str,
+    sender,
+    chat_type: str | None,
+) -> None:
+    result: DownloadResult | None = None
+
+    try:
+        result = await asyncio.wait_for(
+            get_or_download_media(url),
+            timeout=settings.download_timeout_seconds + 15,
+        )
+
+        await wait_for_inline_recipient(sender.id, chat_type)
+        metadata = metadata_for_inline(sender, normalize_url(url), chat_type)
+
         if result.kind == "photo_album":
             result = await asyncio.wait_for(
-                ensure_photo_file_ids(bot, result),
+                ensure_photo_file_ids(
+                    bot,
+                    result,
+                    metadata=metadata,
+                    force_upload=True,
+                ),
                 timeout=settings.telegram_upload_timeout_seconds * settings.telegram_upload_retries + 10,
             )
             remember_inline_ready_media(result, url)
             first_asset = result.assets[0]
 
+            caption = user_caption()
+            if len(result.assets) > 1:
+                caption = f"{caption}\n\n{t.inline_album_ready_retry}"
+
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
                 media=InputMediaPhoto(
                     media=first_asset.telegram_file_id,
-                    caption=(
-                        settings.photo_caption_template.format(url=result.source_url)
-                        if len(result.assets) == 1
-                        else t.inline_album_ready_retry
-                    ),
+                    caption=caption,
+                    parse_mode=None,
                 ),
                 reply_markup=None,
             )
             return
 
         telegram_file_id = await asyncio.wait_for(
-            ensure_telegram_file_id(bot, result),
+            ensure_telegram_file_id(
+                bot,
+                result,
+                metadata=metadata,
+                force_upload=True,
+            ),
             timeout=settings.telegram_upload_timeout_seconds * settings.telegram_upload_retries + 10,
         )
         remember_inline_ready_media(result, url)
@@ -361,6 +476,8 @@ async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -
             inline_message_id=inline_message_id,
             media=InputMediaVideo(
                 media=telegram_file_id,
+                caption=user_caption(),
+                parse_mode=None,
                 supports_streaming=True,
             ),
             reply_markup=None,
@@ -378,3 +495,7 @@ async def process_inline_video_job(bot: Bot, inline_message_id: str, url: str) -
             )
         except Exception:
             logger.exception("Failed to edit inline message with error")
+
+    finally:
+        if result is not None:
+            cleanup_temp_dir(result)
